@@ -34,6 +34,7 @@ class SlackPromptPort(Protocol):
         candidates: Iterable[Participant],
         window: TimeWindow,
         available_alternatives: Iterable[TimeWindow],
+        need_owner: Participant,
     ) -> None:
         ...
 
