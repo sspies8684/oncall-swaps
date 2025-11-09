@@ -436,6 +436,10 @@ def _prompt_blocks(
     alternatives: List[TimeWindow],
     labels: Dict[Tuple[str, str], str],
 ) -> List[dict]:
+    trade_lines = "\n".join(
+        f"• `{_window_to_str(option)}` — {labels.get(_window_key(option), 'trade window')}"
+        for option in alternatives
+    ) or "• No trade windows available yet."
     return [
         {
             "type": "section",
@@ -444,7 +448,8 @@ def _prompt_blocks(
                 "text": (
                     f"*Swap request*\n"
                     f"Can you cover `{_window_to_str(window)}`?\n"
-                    f"Select a shift you'd like covered in return."
+                    f"These are the shifts you can swap for:\n"
+                    f"{trade_lines}"
                 ),
             },
         },
