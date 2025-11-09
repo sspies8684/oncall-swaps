@@ -174,6 +174,12 @@ class SlackBotAdapter(SlackNotificationPort, SlackPromptPort):
         def handle_swap_respond(ack, body, logger):
             ack()
             try:
+                user_id = body["user"]["id"]
+                profile = self.app.client.users_profile_get(user=user_id)
+                email = profile["profile"].get("email")
+                if not email:
+                    raise ValueError("Unable to resolve your email from Slack profile.")
+
                 action_payload = body["actions"][0]
                 value = json.loads(action_payload["value"])
                 offer_id = UUID(value["offer_id"])
@@ -182,7 +188,12 @@ class SlackBotAdapter(SlackNotificationPort, SlackPromptPort):
 
                 offer = self.negotiation_service.get_offer(offer_id)
                 labels = self._labels_for(offer)
-                options = _modal_trade_options(offer, labels, email)
+                options = _modal_trade_options(
+                    offer,
+                    labels,
+                    email,
+                    self.negotiation_service,
+                )
                 if not options:
                     self._post_update(
                         offer_id,
@@ -557,9 +568,24 @@ def _availability_blocks(offer: SwapOffer, labels: Dict[Tuple[str, str], str]) -
     ]
 
 
-def _modal_trade_options(offer: SwapOffer, labels: Dict[Tuple[str, str], str], responder_email: str | None) -> List[dict]:
+def _modal_trade_options(
+    offer: SwapOffer,
+    labels: Dict[Tuple[str, str], str],
+    responder_email: str | None,
+    service: SwapNegotiationService,
+) -> List[dict]:
     search_set = {window.to_tuple() for window in offer.search_windows}
     responder_email = responder_email.lower() if responder_email else None
+    responder_direct = set()
+    if responder_email:
+        responder_direct = {
+            window.to_tuple()
+            for window in service.get_upcoming_windows(
+                schedule_id=offer.schedule_id,
+                participant_email=responder_email,
+                horizon_days=60,
+            )
+        }
     options: List[dict] = []
     for window in offer.available_windows:
         key = _window_key(window)
@@ -569,8 +595,8 @@ def _modal_trade_options(offer: SwapOffer, labels: Dict[Tuple[str, str], str], r
         text = f"{mode} {_window_to_str(window)}"
         if annotation:
             text = f"{text} — {annotation}"
-        # For direct swaps we only want to show windows that the responder actually works.
-        if is_direct and responder_email and responder_email not in annotation.lower():
+        # For direct swaps only show windows the responder actually works.
+        if is_direct and responder_email and window.to_tuple() not in responder_direct:
             continue
         options.append(
             {
