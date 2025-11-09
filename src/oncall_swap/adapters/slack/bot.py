@@ -182,7 +182,7 @@ class SlackBotAdapter(SlackNotificationPort, SlackPromptPort):
 
                 offer = self.negotiation_service.get_offer(offer_id)
                 labels = self._labels_for(offer)
-                options = _modal_trade_options(offer, labels)
+                options = _modal_trade_options(offer, labels, email)
                 if not options:
                     self._post_update(
                         offer_id,
@@ -557,16 +557,21 @@ def _availability_blocks(offer: SwapOffer, labels: Dict[Tuple[str, str], str]) -
     ]
 
 
-def _modal_trade_options(offer: SwapOffer, labels: Dict[Tuple[str, str], str]) -> List[dict]:
+def _modal_trade_options(offer: SwapOffer, labels: Dict[Tuple[str, str], str], responder_email: str | None) -> List[dict]:
     search_set = {window.to_tuple() for window in offer.search_windows}
+    responder_email = responder_email.lower() if responder_email else None
     options: List[dict] = []
     for window in offer.available_windows:
         key = _window_key(window)
-        mode = "[Direct]" if window.to_tuple() in search_set else "[Ring]"
+        is_direct = window.to_tuple() in search_set
+        mode = "[Direct]" if is_direct else "[Ring]"
         annotation = labels.get(key, "")
         text = f"{mode} {_window_to_str(window)}"
         if annotation:
             text = f"{text} — {annotation}"
+        # For direct swaps we only want to show windows that the responder actually works.
+        if is_direct and responder_email and responder_email not in annotation.lower():
+            continue
         options.append(
             {
                 "text": {"type": "plain_text", "text": text[:75]},
