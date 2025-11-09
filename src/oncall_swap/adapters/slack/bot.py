@@ -145,19 +145,21 @@ class SlackBotAdapter(SlackNotificationPort, SlackPromptPort):
         available_alternatives: Iterable[TimeWindow],
         need_owner: Participant,
     ) -> None:
-        client: WebClient = self.app.client
         labels = self._window_labels.setdefault(offer_id, {})
         labels[_window_key(window)] = f"Needs coverage for {need_owner.email}"
         alternatives = list(available_alternatives)
-        for participant in candidates:
-            client.chat_postMessage(
-                channel=participant.slack_user_id or self.announcement_channel,
-                text=(
-                    f"{need_owner.email} needs coverage for {_window_to_str(window)}. "
-                    "Would you like to trade?"
-                ),
-                blocks=_prompt_blocks(offer_id, window, alternatives, labels),
-            )
+        candidate_emails = ", ".join(sorted({participant.email for participant in candidates})) or "Anyone available"
+
+        prompt_text = (
+            f"🔔 {need_owner.email} needs coverage for `{_window_to_str(window)}`.\n"
+            f"Potential traders: {candidate_emails}"
+        )
+
+        self._post_update(
+            offer_id,
+            prompt_text,
+            _prompt_blocks(offer_id, window, alternatives, labels),
+        )
 
     # Internal ----------------------------------------------------------------
 
