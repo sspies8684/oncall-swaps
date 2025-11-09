@@ -12,6 +12,9 @@ dependencies = [
     "httpx>=0.27.0",
 ]
 
+[project.scripts]
+oncall-swap = "oncall_swap.main:main"
+
 [build-system]
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"

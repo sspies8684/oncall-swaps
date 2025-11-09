@@ -36,35 +36,20 @@ Python reference implementation of an on-call swap negotiation bot that coordina
    pip install -e .
    ```
 
-2. **Bootstrap components**
+2. **Run the Slack bot**
 
-    ```python
-    from slack_bolt import App
-    from oncall_swap import (
-        SwapNegotiationService,
-        SlackBotAdapter,
-        OpsgenieClient,
-        InMemoryOfferRepository,
-        InMemoryParticipantDirectory,
-    )
+     ```bash
+     export SLACK_BOT_TOKEN=xoxb-...
+     export SLACK_SIGNING_SECRET=...
+     export SLACK_APP_TOKEN=xapp-...
+     export OPSGENIE_API_KEY=...
+     export OPSGENIE_SCHEDULE_ID=primary-oncall
+     export SLACK_ANNOUNCEMENT_CHANNEL="#oncall-swaps"  # optional
 
-    directory = InMemoryParticipantDirectory()
-    repository = InMemoryOfferRepository()
-    opsgenie = OpsgenieClient(api_key="YOUR_KEY", directory=directory)
+     oncall-swap
+     ```
 
-    slack_app = App(token="xoxb-...", signing_secret="...")
-    service = SwapNegotiationService(
-        repository=repository,
-        directory=directory,
-        schedule_port=opsgenie,
-        override_port=opsgenie,
-    )
-    slack_bot = SlackBotAdapter(
-        app=slack_app,
-        negotiation_service=service,
-        announcement_channel="#oncall-swaps",
-    )
-    ```
+     The CLI stitches together the in-memory repository/directory, Opsgenie client, and Slack adapter, launching a Socket Mode listener.
 
 3. **Create an offer**
 
@@ -117,3 +102,7 @@ from oncall_swap.application.services import SwapNegotiationService
 - Persist offers (e.g., Postgres) by implementing `OfferRepository`.
 - Sync Slack user IDs into the participant directory to replace channel fallbacks.
 - Extend Opsgenie client to support pagination and timezone-aware parsing.
+
+## Continuous Integration
+
+GitHub Actions (`.github/workflows/tests.yml`) installs the project and runs `pytest` on every push and pull request.
