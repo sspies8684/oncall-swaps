@@ -50,7 +50,8 @@ Python reference implementation of an on-call swap negotiation bot that coordina
      ```
 
      The CLI stitches together the in-memory repository/directory, Opsgenie client, and Slack adapter, launching a Socket Mode listener.
-    - In Slack, run the `/swap-oncall` command to pick the shift you want to give away and the period you can cover instead.
+     - In Slack, run the `/swap-oncall` command to pick the shift you want to give away and the period you can cover instead.
+     - Every trade option posted in the announcement thread has a **Respond** button. Clicking it opens a private modal that shows possible trade-in dates tagged with `[Direct]` or `[Ring]`, so responders immediately know whether they are closing the swap or extending the chain.
 
 3. **Create an offer**
 
@@ -107,3 +108,7 @@ from oncall_swap.application.services import SwapNegotiationService
 ## Continuous Integration
 
 GitHub Actions (`.github/workflows/tests.yml`) installs the project and runs `pytest` on every push and pull request.
+
+## Local Opsgenie Mock
+
+For development you can import `MockOpsgenieClient` from `oncall_swap.adapters.opsgenie.mock`. It models a simple four-person rotation (`s+1@sloc.de` … `s+4@sloc.de`) and records overrides in memory—handy when you want to run the Slack workflow without hitting the real Opsgenie API.

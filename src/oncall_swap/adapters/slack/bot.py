@@ -54,7 +54,7 @@ class SlackBotAdapter(SlackNotificationPort, SlackPromptPort):
         self._offer_threads[offer.id] = (response["channel"], response["ts"])
         labels = self._window_labels.setdefault(offer.id, {})
         for window in offer.available_windows:
-            labels[_window_key(window)] = f"Requester availability ({offer.requester.email})"
+            labels[_window_key(window)] = f"[Direct] Requester availability ({offer.requester.email})"
 
     def notify_direct_swap(self, offer: SwapOffer, participant: Participant, window: TimeWindow) -> None:
         labels = self._labels_for(offer)
@@ -81,7 +81,7 @@ class SlackBotAdapter(SlackNotificationPort, SlackPromptPort):
         labels = self._window_labels.setdefault(offer.id, {})
         for window in offer.available_windows:
             key = _window_key(window)
-            labels.setdefault(key, f"Needs coverage for {candidate.email}")
+            labels.setdefault(key, f"[Ring] Needs coverage for {candidate.email}")
 
         self._post_update(
             offer.id,
@@ -146,7 +146,7 @@ class SlackBotAdapter(SlackNotificationPort, SlackPromptPort):
         need_owner: Participant,
     ) -> None:
         labels = self._window_labels.setdefault(offer_id, {})
-        labels[_window_key(window)] = f"Needs coverage for {need_owner.email}"
+        labels[_window_key(window)] = f"[Ring] Needs coverage for {need_owner.email}"
         alternatives = list(available_alternatives)
         candidate_emails = ", ".join(sorted({participant.email for participant in candidates})) or "Anyone available"
 
@@ -158,36 +158,100 @@ class SlackBotAdapter(SlackNotificationPort, SlackPromptPort):
         self._post_update(
             offer_id,
             prompt_text,
-            _prompt_blocks(offer_id, window, alternatives, labels),
+            _prompt_blocks(
+                offer_id,
+                window,
+                alternatives,
+                labels,
+                need_owner.email,
+            ),
         )
 
     # Internal ----------------------------------------------------------------
 
     def _register_handlers(self) -> None:
-        @self.app.action("swap_accept")
-        def handle_swap_accept(ack, body, logger):
+        @self.app.action("swap_respond")
+        def handle_swap_respond(ack, body, logger):
             ack()
-            user = body["user"]["id"]
-            payload = json.loads(body["actions"][0]["value"])
             try:
-                profile = self.app.client.users_profile_get(user=user)
+                action_payload = body["actions"][0]
+                value = json.loads(action_payload["value"])
+                offer_id = UUID(value["offer_id"])
+                covers_window = _parse_window_value(json.dumps(value["covers_window"]))
+                need_owner_email = value.get("need_owner")
+
+                offer = self.negotiation_service.get_offer(offer_id)
+                labels = self._labels_for(offer)
+                options = _modal_trade_options(offer, labels)
+                if not options:
+                    self._post_update(
+                        offer_id,
+                        "⚠️ No trade windows are currently available. Please wait for new options.",
+                    )
+                    return
+
+                modal = _build_response_modal(
+                    offer=offer,
+                    covers_window=covers_window,
+                    need_owner_email=need_owner_email,
+                    options=options,
+                )
+                self.app.client.views_open(trigger_id=body["trigger_id"], view=modal)
+            except Exception as exc:  # noqa: BLE001
+                logger.error("Failed to open response modal: %s", exc, exc_info=True)
+
+        @self.app.view("swap_response_submit")
+        def handle_swap_response_submit(ack, body, logger):
+            metadata = json.loads(body["view"]["private_metadata"])
+            state = body["view"]["state"]["values"]
+            user_id = body["user"]["id"]
+
+            selected_option = state["trade_select_block"]["trade_select"].get("selected_option")
+            if not selected_option:
+                ack(
+                    {
+                        "response_action": "errors",
+                        "errors": {
+                            "trade_select_block": "Please choose a trade window.",
+                        },
+                    }
+                )
+                return
+
+            ack()
+
+            try:
+                profile = self.app.client.users_profile_get(user=user_id)
                 email = profile["profile"].get("email")
                 if not email:
                     raise ValueError("Unable to resolve your email from Slack profile.")
+
+                offer_id = UUID(metadata["offer_id"])
+                offer = self.negotiation_service.get_offer(offer_id)
+
+                covers_window = _parse_window_value(json.dumps(metadata["covers_window"]))
+                need_window = _parse_window_value(selected_option["value"])
+
                 command = AcceptCoverCommand(
-                    offer_id=UUID(payload["offer_id"]),
+                    offer_id=offer_id,
                     participant_email=email,
-                    covers_window=TimeWindowDTO(**payload["covers_window"]),
-                    needs_windows=[TimeWindowDTO(**window) for window in payload.get("needs_windows", [])],
+                    covers_window=TimeWindowDTO(start=covers_window.start, end=covers_window.end),
+                    needs_windows=[
+                        TimeWindowDTO(start=need_window.start, end=need_window.end),
+                    ],
                 )
-                self.negotiation_service.accept_cover(command)
+                result = self.negotiation_service.accept_cover(command)
+
+                channel_ts = self._offer_threads.get(offer_id)
+                if channel_ts:
+                    self.app.client.chat_postEphemeral(
+                        channel=channel_ts[0],
+                        user=user_id,
+                        text="Thanks! Your swap response has been recorded.",
+                    )
+
             except Exception as exc:  # noqa: BLE001
-                logger.error("Failed to process swap acceptance: %s", exc, exc_info=True)
-                self.app.client.chat_postEphemeral(
-                    channel=body["channel"]["id"],
-                    user=user,
-                    text=f"Something went wrong while processing your response: {exc}",
-                )
+                logger.error("Failed to process swap response: %s", exc, exc_info=True)
 
         @self.app.command("/swap-oncall")
         def handle_swap_command(ack, body, respond, logger):
@@ -442,6 +506,7 @@ def _prompt_blocks(
     window: TimeWindow,
     alternatives: List[TimeWindow],
     labels: Dict[Tuple[str, str], str],
+    need_owner_email: str,
 ) -> List[dict]:
     trade_lines = "\n".join(
         f"• `{_window_to_str(option)}` — {labels.get(_window_key(option), 'trade window')}"
@@ -464,25 +529,16 @@ def _prompt_blocks(
             "type": "actions",
             "elements": [
                 {
-                    "type": "static_select",
-                    "placeholder": {"type": "plain_text", "text": "Pick a window"},
-                    "action_id": "swap_accept",
-                    "options": [
+                    "type": "button",
+                    "action_id": "swap_respond",
+                    "text": {"type": "plain_text", "text": "Respond"},
+                    "value": json.dumps(
                         {
-                                "text": {
-                                    "type": "plain_text",
-                                    "text": _annotated_window(option, labels),
-                                },
-                            "value": json.dumps(
-                                {
-                                    "offer_id": str(offer_id),
-                                    "covers_window": _window_to_value(window),
-                                    "needs_windows": [_window_to_value(option)],
-                                }
-                            ),
+                            "offer_id": str(offer_id),
+                            "covers_window": _window_to_value(window),
+                            "need_owner": need_owner_email,
                         }
-                        for option in alternatives
-                    ],
+                    ),
                 }
             ],
         },
@@ -499,6 +555,70 @@ def _availability_blocks(offer: SwapOffer, labels: Dict[Tuple[str, str], str]) -
             },
         }
     ]
+
+
+def _modal_trade_options(offer: SwapOffer, labels: Dict[Tuple[str, str], str]) -> List[dict]:
+    search_set = {window.to_tuple() for window in offer.search_windows}
+    options: List[dict] = []
+    for window in offer.available_windows:
+        key = _window_key(window)
+        mode = "[Direct]" if window.to_tuple() in search_set else "[Ring]"
+        annotation = labels.get(key, "")
+        text = f"{mode} {_window_to_str(window)}"
+        if annotation:
+            text = f"{text} — {annotation}"
+        options.append(
+            {
+                "text": {"type": "plain_text", "text": text[:75]},
+                "value": json.dumps(_window_to_value(window)),
+            }
+        )
+    return options
+
+
+def _build_response_modal(
+    *,
+    offer: SwapOffer,
+    covers_window: TimeWindow,
+    need_owner_email: Optional[str],
+    options: List[dict],
+) -> dict:
+    owner_label = need_owner_email or "the requester"
+    metadata = {
+        "offer_id": str(offer.id),
+        "covers_window": _window_to_value(covers_window),
+        "need_owner": need_owner_email,
+    }
+    return {
+        "type": "modal",
+        "callback_id": "swap_response_submit",
+        "private_metadata": json.dumps(metadata),
+        "title": {"type": "plain_text", "text": "Confirm Swap"},
+        "submit": {"type": "plain_text", "text": "Submit"},
+        "close": {"type": "plain_text", "text": "Cancel"},
+        "blocks": [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        f"You are offering to cover `{_window_to_str(covers_window)}` "
+                        f"for {owner_label}. Choose a shift you would like covered in return."
+                    ),
+                },
+            },
+            {
+                "type": "input",
+                "block_id": "trade_select_block",
+                "label": {"type": "plain_text", "text": "Trade-in shift"},
+                "element": {
+                    "type": "static_select",
+                    "action_id": "trade_select",
+                    "options": options,
+                },
+            },
+        ],
+    }
 
 
 def _offer_summary_text(offer: SwapOffer, labels: Dict[Tuple[str, str], str], header: str = "*New swap offer*") -> str:
@@ -524,14 +644,6 @@ def _commitment_summary(offer: SwapOffer) -> str:
         for commitment in ring.commitments
     ]
     return "*Swap summary:*\n" + "\n".join(lines)
-
-
-def _annotation(labels: Dict[Tuple[str, str], str], window: TimeWindow) -> str:
-    return labels.get(_window_key(window), "trade window")
-
-
-def _annotated_window(window: TimeWindow, labels: Dict[Tuple[str, str], str]) -> str:
-    return f"{_window_to_str(window)} — {_annotation(labels, window)}"
 
 
 def _window_key(window: TimeWindow) -> Tuple[str, str]:
