@@ -110,6 +110,7 @@ class SlackBotAdapter(SlackNotificationPort, SlackPromptPort):
         )
 
     def notify_ring_completion(self, offer: SwapOffer) -> None:
+        summary_text = _commitment_summary(offer)
         self._post_update(
             offer.id,
             "🎉 Ring swap completed.",
@@ -120,9 +121,17 @@ class SlackBotAdapter(SlackNotificationPort, SlackPromptPort):
                         "type": "mrkdwn",
                         "text": "On-call ring swap successfully orchestrated and synced with Opsgenie.",
                     },
-                }
+                },
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": summary_text,
+                    },
+                },
             ],
         )
+        self._add_reaction(offer.id, "white_check_mark")
         self._offer_threads.pop(offer.id, None)
         self._window_labels.pop(offer.id, None)
 
@@ -312,6 +321,21 @@ class SlackBotAdapter(SlackNotificationPort, SlackPromptPort):
             labels.setdefault(_window_key(window), "Trade window")
         return labels
 
+    def _add_reaction(self, offer_id: UUID, emoji: str) -> None:
+        channel_ts = self._offer_threads.get(offer_id)
+        if not channel_ts:
+            return
+        channel, thread_ts = channel_ts
+        try:
+            self.app.client.reactions_add(
+                channel=channel,
+                name=emoji,
+                timestamp=thread_ts,
+            )
+        except Exception:
+            # Ignore reaction errors (e.g., reaction already added)
+            pass
+
 def _build_swap_offer_modal(options: List[dict], metadata: str) -> dict:
     return {
         "type": "modal",
@@ -476,6 +500,18 @@ def _offer_summary_text(offer: SwapOffer, labels: Dict[Tuple[str, str], str], he
         f"Trade options:\n"
         f"{trade_lines}"
     )
+
+
+def _commitment_summary(offer: SwapOffer) -> str:
+    if not offer.ring_swaps:
+        return "*Swap summary:*\n• Swap finalised without ring commitments."
+    ring = offer.ring_swaps[-1]
+    lines = [
+        f"• {commitment.from_participant.email} covers `{_window_to_str(commitment.window)}` "
+        f"for {commitment.to_participant.email}"
+        for commitment in ring.commitments
+    ]
+    return "*Swap summary:*\n" + "\n".join(lines)
 
 
 def _annotation(labels: Dict[Tuple[str, str], str], window: TimeWindow) -> str:
