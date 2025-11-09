@@ -50,6 +50,7 @@ Python reference implementation of an on-call swap negotiation bot that coordina
      ```
 
      The CLI stitches together the in-memory repository/directory, Opsgenie client, and Slack adapter, launching a Socket Mode listener.
+    - In Slack, run the `/swap-oncall` command to pick the shift you want to give away and the period you can cover instead.
 
 3. **Create an offer**
 

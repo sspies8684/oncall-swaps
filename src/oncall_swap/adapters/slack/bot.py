@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import json
-from typing import Iterable, List
+from datetime import datetime, timezone
+from typing import Iterable, List, Optional
 from uuid import UUID
 
 from slack_bolt import App
@@ -29,10 +30,12 @@ class SlackBotAdapter(SlackNotificationPort, SlackPromptPort):
         app: App,
         negotiation_service: SwapNegotiationService,
         announcement_channel: str,
+        schedule_id: str,
     ) -> None:
         self.app = app
         self.negotiation_service = negotiation_service
         self.announcement_channel = announcement_channel
+        self.schedule_id = schedule_id
         # Ensure the service outputs through this adapter.
         self.negotiation_service.slack_notifications = self
         self.negotiation_service.slack_prompts = self
@@ -44,7 +47,7 @@ class SlackBotAdapter(SlackNotificationPort, SlackPromptPort):
         self.app.client.chat_postMessage(
             channel=self.announcement_channel,
             text=f"🌀 New on-call swap offer from {offer.requester.email}",
-            blocks=self._offer_blocks(offer),
+            blocks=_offer_blocks(offer),
         )
 
     def notify_direct_swap(self, offer: SwapOffer, participant: Participant, window: TimeWindow) -> None:
@@ -81,7 +84,7 @@ class SlackBotAdapter(SlackNotificationPort, SlackPromptPort):
                         ),
                     },
                 },
-                *self._availability_blocks(offer),
+                *_availability_blocks(offer),
             ],
         )
 
@@ -89,7 +92,7 @@ class SlackBotAdapter(SlackNotificationPort, SlackPromptPort):
         self.app.client.chat_postMessage(
             channel=self.announcement_channel,
             text="🔁 On-call ring swap updated.",
-            blocks=self._availability_blocks(offer),
+            blocks=_availability_blocks(offer),
         )
 
     def notify_ring_completion(self, offer: SwapOffer) -> None:
@@ -122,7 +125,7 @@ class SlackBotAdapter(SlackNotificationPort, SlackPromptPort):
             client.chat_postMessage(
                 channel=participant.slack_user_id or self.announcement_channel,
                 text=f"On-call coverage request for {_window_to_str(window)}.",
-                blocks=self._prompt_blocks(offer_id, window, alternatives),
+                blocks=_prompt_blocks(offer_id, window, alternatives),
             )
 
     # Internal ----------------------------------------------------------------
@@ -153,71 +156,269 @@ class SlackBotAdapter(SlackNotificationPort, SlackPromptPort):
                     text=f"Something went wrong while processing your response: {exc}",
                 )
 
-    def _offer_blocks(self, offer: SwapOffer) -> List[dict]:
-        return [
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": (
-                        f"*New swap offer*\n"
-                        f"Requester: `{offer.requester.email}`\n"
-                        f"Needs coverage for: `{_window_to_str(offer.let_window)}`\n"
-                        f"Can cover: {', '.join(f'`{_window_to_str(win)}`' for win in offer.available_windows)}"
-                    ),
-                },
-            }
-        ]
+        @self.app.command("/swap-oncall")
+        def handle_swap_command(ack, body, respond, logger):
+            ack()
+            try:
+                user_id = body["user_id"]
+                channel_id = body.get("channel_id")
+                profile = self.app.client.users_profile_get(user=user_id)
+                email = profile["profile"].get("email")
+                if not email:
+                    respond("Unable to determine your email from your Slack profile.")
+                    return
 
-    def _prompt_blocks(self, offer_id: UUID, window: TimeWindow, alternatives: List[TimeWindow]) -> List[dict]:
-        return [
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": (
-                        f"*Swap request*\n"
-                        f"Can you cover `{_window_to_str(window)}`?\n"
-                        f"Select a shift you'd like covered in return."
+                windows = self.negotiation_service.get_upcoming_windows(
+                    schedule_id=self.schedule_id,
+                    participant_email=email,
+                )
+                if not windows:
+                    respond("No upcoming on-call windows found for you in Opsgenie.")
+                    return
+
+                options = [_modal_option_from_window(window) for window in windows[:25]]
+
+                self.app.client.views_open(
+                    trigger_id=body["trigger_id"],
+                    view=_build_swap_offer_modal(
+                        options=options,
+                        metadata=json.dumps(
+                            {"email": email, "channel": channel_id, "schedule_id": self.schedule_id}
+                        ),
                     ),
-                },
-            },
-            {
-                "type": "actions",
-                "elements": [
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error("Failed to open swap offer modal: %s", exc, exc_info=True)
+                respond(f"Failed to start swap offer: {exc}")
+
+        @self.app.view("swap_offer_submit")
+        def handle_swap_submit(ack, body, logger):
+            state = body["view"]["state"]["values"]
+            metadata = json.loads(body["view"]["private_metadata"])
+            user_id = body["user"]["id"]
+
+            try:
+                let_selection = state["let_window_block"]["let_window"]["selected_option"]
+                let_window = _parse_window_value(let_selection["value"])
+
+                search_start = _combine_date_time(
+                    state["search_start_date_block"]["search_start_date"]["selected_date"],
+                    state["search_start_time_block"]["search_start_time"]["selected_time"],
+                )
+                search_end = _combine_date_time(
+                    state["search_end_date_block"]["search_end_date"]["selected_date"],
+                    state["search_end_time_block"]["search_end_time"]["selected_time"],
+                )
+
+                if not search_start or not search_end:
+                    ack(
+                        {
+                            "response_action": "errors",
+                            "errors": {
+                                "search_end_date_block": "Please provide both start and end date/time."
+                            },
+                        }
+                    )
+                    return
+
+                if search_end <= search_start:
+                    ack(
+                        {
+                            "response_action": "errors",
+                            "errors": {
+                                "search_end_date_block": "The end time must be after the start time."
+                            },
+                        }
+                    )
+                    return
+
+                command = CreateOfferCommand(
+                    requester_email=metadata["email"],
+                    schedule_id=metadata["schedule_id"],
+                    let_window=TimeWindowDTO(start=let_window.start, end=let_window.end),
+                    search_windows=[
+                        TimeWindowDTO(start=search_start, end=search_end),
+                    ],
+                )
+
+                offer = self.negotiation_service.create_offer(command)
+                ack()
+
+                channel = metadata.get("channel")
+                if channel:
+                    self.app.client.chat_postEphemeral(
+                        channel=channel,
+                        user=user_id,
+                        text=f"Created swap offer for {_window_to_str(offer.let_window)}.",
+                    )
+            except SwapOffer.TimeWindowInPastError as exc:
+                ack(
                     {
-                        "type": "static_select",
-                        "placeholder": {"type": "plain_text", "text": "Pick a window"},
-                        "action_id": "swap_accept",
-                        "options": [
-                            {
-                                "text": {"type": "plain_text", "text": _window_to_str(option)},
-                                "value": json.dumps(
-                                    {
-                                        "offer_id": str(offer_id),
-                                        "covers_window": _window_to_value(window),
-                                        "needs_windows": [_window_to_value(option)],
-                                    }
-                                ),
-                            }
-                            for option in alternatives
-                        ],
+                        "response_action": "errors",
+                        "errors": {
+                            "search_end_date_block": str(exc),
+                        },
                     }
-                ],
-            },
-        ]
-
-    def _availability_blocks(self, offer: SwapOffer) -> List[dict]:
-        return [
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error("Failed to create swap offer: %s", exc, exc_info=True)
+                ack({"response_action": "clear"})
+                channel = metadata.get("channel")
+                if channel:
+                    self.app.client.chat_postEphemeral(
+                        channel=channel,
+                        user=user_id,
+                        text=f"Failed to create offer: {exc}",
+                    )
+def _build_swap_offer_modal(options: List[dict], metadata: str) -> dict:
+    return {
+        "type": "modal",
+        "callback_id": "swap_offer_submit",
+        "private_metadata": metadata,
+        "title": {"type": "plain_text", "text": "Create Swap Offer"},
+        "submit": {"type": "plain_text", "text": "Create"},
+        "close": {"type": "plain_text", "text": "Cancel"},
+        "blocks": [
             {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": (
-                        "*Updated availability*\n"
-                        f"Coverage sought for: `{_window_to_str(offer.let_window)}`\n"
-                        f"Trade options now include: {', '.join(f'`{_window_to_str(win)}`' for win in offer.available_windows)}"
-                    ),
+                "type": "input",
+                "block_id": "let_window_block",
+                "label": {"type": "plain_text", "text": "Shift you want to give away"},
+                "element": {
+                    "type": "static_select",
+                    "action_id": "let_window",
+                    "options": options,
                 },
-            }
-        ]
+            },
+            {
+                "type": "input",
+                "block_id": "search_start_date_block",
+                "label": {"type": "plain_text", "text": "Preferred coverage start date"},
+                "element": {
+                    "type": "datepicker",
+                    "action_id": "search_start_date",
+                },
+            },
+            {
+                "type": "input",
+                "block_id": "search_start_time_block",
+                "label": {"type": "plain_text", "text": "Preferred coverage start time (UTC)"},
+                "element": {
+                    "type": "timepicker",
+                    "action_id": "search_start_time",
+                },
+            },
+            {
+                "type": "input",
+                "block_id": "search_end_date_block",
+                "label": {"type": "plain_text", "text": "Preferred coverage end date"},
+                "element": {
+                    "type": "datepicker",
+                    "action_id": "search_end_date",
+                },
+            },
+            {
+                "type": "input",
+                "block_id": "search_end_time_block",
+                "label": {"type": "plain_text", "text": "Preferred coverage end time (UTC)"},
+                "element": {
+                    "type": "timepicker",
+                    "action_id": "search_end_time",
+                },
+            },
+        ],
+    }
+
+
+def _modal_option_from_window(window: TimeWindow) -> dict:
+    return {
+        "text": {"type": "plain_text", "text": _window_to_str(window)[:75]},
+        "value": json.dumps(_window_to_value(window)),
+    }
+
+
+def _parse_window_value(value: str) -> TimeWindow:
+    payload = json.loads(value)
+    start = datetime.fromisoformat(payload["start"])
+    end = datetime.fromisoformat(payload["end"])
+    return TimeWindow(start=start, end=end)
+
+
+def _combine_date_time(date_str: str | None, time_str: str | None) -> Optional[datetime]:
+    if not date_str or not time_str:
+        return None
+    combined = datetime.fromisoformat(f"{date_str}T{time_str}")
+    if combined.tzinfo is None:
+        combined = combined.replace(tzinfo=timezone.utc)
+    return combined.astimezone(timezone.utc)
+
+
+def _offer_blocks(offer: SwapOffer) -> List[dict]:
+    return [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    f"*New swap offer*\n"
+                    f"Requester: `{offer.requester.email}`\n"
+                    f"Needs coverage for: `{_window_to_str(offer.let_window)}`\n"
+                    f"Can cover: {', '.join(f'`{_window_to_str(win)}`' for win in offer.available_windows)}"
+                ),
+            },
+        }
+    ]
+
+
+def _prompt_blocks(offer_id: UUID, window: TimeWindow, alternatives: List[TimeWindow]) -> List[dict]:
+    return [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    f"*Swap request*\n"
+                    f"Can you cover `{_window_to_str(window)}`?\n"
+                    f"Select a shift you'd like covered in return."
+                ),
+            },
+        },
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "static_select",
+                    "placeholder": {"type": "plain_text", "text": "Pick a window"},
+                    "action_id": "swap_accept",
+                    "options": [
+                        {
+                            "text": {"type": "plain_text", "text": _window_to_str(option)},
+                            "value": json.dumps(
+                                {
+                                    "offer_id": str(offer_id),
+                                    "covers_window": _window_to_value(window),
+                                    "needs_windows": [_window_to_value(option)],
+                                }
+                            ),
+                        }
+                        for option in alternatives
+                    ],
+                }
+            ],
+        },
+    ]
+
+
+def _availability_blocks(offer: SwapOffer) -> List[dict]:
+    return [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    "*Updated availability*\n"
+                    f"Coverage sought for: `{_window_to_str(offer.let_window)}`\n"
+                    f"Trade options now include: {', '.join(f'`{_window_to_str(win)}`' for win in offer.available_windows)}"
+                ),
+            },
+        }
+    ]

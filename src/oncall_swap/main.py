@@ -65,6 +65,7 @@ def main() -> None:
         app=slack_app,
         negotiation_service=service,
         announcement_channel=announcement_channel,
+        schedule_id=schedule_id,
     )
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")

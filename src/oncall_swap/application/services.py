@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 from uuid import UUID
 
@@ -215,6 +216,26 @@ class SwapNegotiationService:
             return existing
         participant = Participant(email=email)
         return self.directory.upsert(participant)
+
+    def get_upcoming_windows(
+        self,
+        schedule_id: str,
+        participant_email: str,
+        *,
+        horizon_days: int = 30,
+        now: Optional[datetime] = None,
+    ) -> List[TimeWindow]:
+        """Return future on-call windows for the given participant within the horizon."""
+
+        window_start = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        window_end = window_start + timedelta(days=horizon_days)
+        assignments = self.schedule_port.list_oncall(schedule_id, window_start, window_end)
+        target_email = participant_email.lower()
+        return [
+            assignment.window
+            for assignment in assignments
+            if assignment.participant.email.lower() == target_email
+        ]
 
     @staticmethod
     def _to_window(dto: TimeWindowDTO) -> TimeWindow:
