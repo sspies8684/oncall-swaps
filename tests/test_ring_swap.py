@@ -57,8 +57,9 @@ class DummySlack(SlackNotificationPort, SlackPromptPort):
         candidates: Iterable[Participant],
         window: TimeWindow,
         available_alternatives: Iterable[TimeWindow],
+        need_owner: Participant,
     ) -> None:
-        self.prompt_requests.append((offer_id, [c.email for c in candidates]))
+        self.prompt_requests.append((offer_id, [c.email for c in candidates], need_owner.email))
 
 
 def make_window(day_offset: int) -> TimeWindowDTO:

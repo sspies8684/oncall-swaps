@@ -92,11 +92,13 @@ class SwapNegotiationService:
             offer.record_ring_candidate(participant, needs_windows)
             notifications, _ = self._require_slack_ports()
             notifications.notify_ring_candidate(offer, participant)
+            self._prompt_for_new_needs(offer, needs_windows, participant)
         else:
             offer.add_available_windows(needs_windows)
             offer.outstanding_needs.extend(
                 WindowNeed(owner=participant, window=window, created_by_offer=False) for window in needs_windows
             )
+            self._prompt_for_new_needs(offer, needs_windows, participant)
 
         self.repository.update(offer)
         ring = self._try_complete_ring(offer)
@@ -120,23 +122,25 @@ class SwapNegotiationService:
     # Helpers -----------------------------------------------------------------
 
     def _prompt_initial_participants(self, offer: SwapOffer) -> None:
-        horizon_start = min([offer.let_window.start] + [w.start for w in offer.search_windows])
-        horizon_end = max([offer.let_window.end] + [w.end for w in offer.search_windows])
-        assignments = self.schedule_port.list_oncall(
-            schedule_id=offer.schedule_id,
-            start=horizon_start,
-            end=horizon_end,
-        )
+        assignments = self._list_oncall_assignments(offer)
 
-        search_participants = []
-        ring_participants = []
+        search_participants: List[Participant] = []
+        ring_participants: List[Participant] = []
+        seen_search = set()
+        seen_ring = set()
+        search_windows = {w.to_tuple() for w in offer.search_windows}
+
         for assignment in assignments:
             if assignment.participant.id == offer.requester.id:
                 continue
-            if any(assignment.window.to_tuple() == w.to_tuple() for w in offer.search_windows):
-                search_participants.append(assignment.participant)
+            if assignment.window.to_tuple() in search_windows:
+                if assignment.participant.id not in seen_search:
+                    search_participants.append(assignment.participant)
+                    seen_search.add(assignment.participant.id)
             else:
-                ring_participants.append(assignment.participant)
+                if assignment.participant.id not in seen_ring:
+                    ring_participants.append(assignment.participant)
+                    seen_ring.add(assignment.participant.id)
 
         _, prompts = self._require_slack_ports()
         if search_participants:
@@ -145,6 +149,7 @@ class SwapNegotiationService:
                 search_participants,
                 offer.let_window,
                 offer.search_windows,
+                offer.requester,
             )
         if ring_participants:
             prompts.prompt_cover_request(
@@ -152,6 +157,7 @@ class SwapNegotiationService:
                 ring_participants,
                 offer.let_window,
                 offer.available_windows,
+                offer.requester,
             )
 
     def _apply_direct_override(self, offer: SwapOffer, participant: Participant, swap_window: TimeWindow) -> None:
@@ -245,4 +251,51 @@ class SwapNegotiationService:
         if self.slack_notifications is None or self.slack_prompts is None:
             raise RuntimeError("Slack ports are not configured for SwapNegotiationService.")
         return self.slack_notifications, self.slack_prompts
+
+    def _list_oncall_assignments(self, offer: SwapOffer) -> List[OnCallAssignment]:
+        windows = [offer.let_window] + list(offer.search_windows)
+        start = min(window.start for window in windows)
+        end = max(window.end for window in windows)
+        return self.schedule_port.list_oncall(
+            schedule_id=offer.schedule_id,
+            start=start,
+            end=end,
+        )
+
+    def _search_participants(self, offer: SwapOffer) -> List[Participant]:
+        assignments = self._list_oncall_assignments(offer)
+        search_windows = {w.to_tuple() for w in offer.search_windows}
+        participants: List[Participant] = []
+        seen = set()
+        for assignment in assignments:
+            if assignment.participant.id == offer.requester.id:
+                continue
+            if assignment.window.to_tuple() in search_windows and assignment.participant.id not in seen:
+                participants.append(assignment.participant)
+                seen.add(assignment.participant.id)
+        return participants
+
+    def _prompt_for_new_needs(
+        self,
+        offer: SwapOffer,
+        needs_windows: List[TimeWindow],
+        owner: Participant,
+    ) -> None:
+        _, prompts = self._require_slack_ports()
+        candidates = [p for p in self._search_participants(offer) if p.id != owner.id]
+        if not candidates:
+            return
+        seen = set()
+        for need in needs_windows:
+            key = need.to_tuple()
+            if key in seen:
+                continue
+            seen.add(key)
+            prompts.prompt_cover_request(
+                offer.id,
+                candidates,
+                need,
+                offer.available_windows,
+                owner,
+            )
 
