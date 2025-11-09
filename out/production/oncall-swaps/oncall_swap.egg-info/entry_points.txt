@@ -1,0 +1,2 @@
+[console_scripts]
+oncall-swap = oncall_swap.main:main

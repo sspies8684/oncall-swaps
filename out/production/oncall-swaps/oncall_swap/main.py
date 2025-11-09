@@ -75,15 +75,11 @@ def main() -> None:
     logging.info("Starting on-call swap bot for schedule '%s'", os.environ["OPSGENIE_SCHEDULE_ID"])
 
     handler = SocketModeHandler(slack_app, os.environ["SLACK_APP_TOKEN"])
-    logging.info("Connecting to Slack via Socket Mode...")
     try:
         handler.start()
     except KeyboardInterrupt:
         logging.info("Shutting down on-call swap bot")
         sys.exit(0)
-    except Exception as e:
-        logging.error("Failed to connect to Slack: %s", e, exc_info=True)
-        raise SystemExit(f"Failed to connect to Slack: {e}")
 
 
 if __name__ == "__main__":

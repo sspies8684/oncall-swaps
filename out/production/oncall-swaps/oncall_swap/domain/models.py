@@ -138,42 +138,16 @@ class SwapOffer(BaseModel):
                 self.available_windows.append(window)
 
     def find_need(self, window: TimeWindow) -> Optional[WindowNeed]:
-        """Find a need that matches the given window.
-        
-        Matches by date range overlap rather than exact datetime match,
-        since windows may come from different sources (date picker vs Opsgenie)
-        with different times but represent the same day(s).
-        """
-        window_start_date = window.start.date()
-        window_end_date = window.end.date()
-        
         for need in self.outstanding_needs:
-            need_start_date = need.window.start.date()
-            need_end_date = need.window.end.date()
-            
-            # Check if the windows overlap by date
-            # Windows overlap if they share at least one day
-            if window_start_date <= need_end_date and need_start_date <= window_end_date:
+            if need.window.to_tuple() == window.to_tuple():
                 return need
         return None
 
     def resolve_need(self, window: TimeWindow) -> Optional[WindowNeed]:
-        """Remove a need that matches the given window.
-        
-        Uses the same date-based matching as find_need.
-        """
         need = self.find_need(window)
         if need:
-            # Remove the matched need by comparing date ranges
-            window_start_date = window.start.date()
-            window_end_date = window.end.date()
             self.outstanding_needs = [
-                existing
-                for existing in self.outstanding_needs
-                if not (
-                    existing.window.start.date() <= window_end_date
-                    and window_start_date <= existing.window.end.date()
-                )
+                existing for existing in self.outstanding_needs if existing.window.to_tuple() != window.to_tuple()
             ]
         return need
 

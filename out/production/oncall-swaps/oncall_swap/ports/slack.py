@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-from typing import Iterable, List, Optional, Protocol
+from typing import Iterable, Protocol
 from uuid import UUID
 
 from oncall_swap.domain.models import Participant, SwapOffer, TimeWindow
-from oncall_swap.ports.opsgenie import OnCallAssignment
 
 
 class SlackNotificationPort(Protocol):
@@ -13,13 +12,7 @@ class SlackNotificationPort(Protocol):
     def announce_offer(self, offer: SwapOffer) -> None:
         ...
 
-    def notify_direct_swap(
-        self,
-        offer: SwapOffer,
-        participant: Participant,
-        window: TimeWindow,
-        all_assignments: Optional[List[OnCallAssignment]] = None,
-    ) -> None:
+    def notify_direct_swap(self, offer: SwapOffer, participant: Participant, window: TimeWindow) -> None:
         ...
 
     def notify_ring_candidate(self, offer: SwapOffer, candidate: Participant) -> None:

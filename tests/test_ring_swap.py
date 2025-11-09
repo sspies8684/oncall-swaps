@@ -1,5 +1,5 @@
 from datetime import datetime, timedelta, timezone
-from typing import Iterable, List
+from typing import Iterable, List, Optional
 from uuid import UUID
 
 import pytest
@@ -33,14 +33,23 @@ class DummySlack(SlackNotificationPort, SlackPromptPort):
     def __init__(self) -> None:
         self.announcements: List[SwapOffer] = []
         self.prompt_requests: List[tuple[UUID, List[str], str]] = []
-        self.direct_swaps: List[str] = []
+        self.direct_swaps: List[tuple[Participant, TimeWindow]] = []
         self.ring_completions: int = 0
+        self.last_direct_swap_assignments: List[OnCallAssignment] = []
 
     def announce_offer(self, offer: SwapOffer) -> None:
         self.announcements.append(offer)
 
-    def notify_direct_swap(self, offer: SwapOffer, participant: Participant, window: TimeWindow) -> None:
-        self.direct_swaps.append(participant.email)
+    def notify_direct_swap(
+        self,
+        offer: SwapOffer,
+        participant: Participant,
+        window: TimeWindow,
+        all_assignments: Optional[List[OnCallAssignment]] = None,
+    ) -> None:
+        self.direct_swaps.append((participant, window))
+        if all_assignments:
+            self.last_direct_swap_assignments = all_assignments
 
     def notify_ring_candidate(self, offer: SwapOffer, candidate: Participant) -> None:
         pass
@@ -132,10 +141,10 @@ def test_ring_swap_resolution():
         )
     )
 
-    assert ring_result is not None
-    assert len(ring_result.commitments) == 3
+    # Direct swap closing ring swap chain returns None
+    assert ring_result is None
     assert override_port.applied  # overrides applied
-    assert slack.ring_completions == 1
+    assert len(slack.direct_swaps) == 1  # Direct swap notification
 
 
 def test_ring_and_direct_swap_resolution():
@@ -200,8 +209,9 @@ def test_ring_and_direct_swap_resolution():
         )
     )
 
-    assert ring_result is not None
-    assert slack.ring_completions == 1
+    # Direct swap closing ring swap chain returns None
+    assert ring_result is None
+    assert len(slack.direct_swaps) == 1  # Direct swap notification
 
 
 def test_ring_candidate_then_direct_swap_closes_offer():
@@ -264,8 +274,120 @@ def test_ring_candidate_then_direct_swap_closes_offer():
     )
 
     assert direct_result is not None
-    assert slack.direct_swaps[-1] == direct_participant.email
+    notified_participant, _ = slack.direct_swaps[-1]
+    assert notified_participant.email == direct_participant.email
     assert slack.ring_completions == 0
+
+
+def test_ring_swap_then_direct_swap_to_let_window():
+    """
+    Test scenario:
+    - P1 offers: let_window = T1, search_windows = [T5]
+    - P2 creates ring swap: covers T1, needs T10 (outside search_windows)
+    - P3 makes direct swap: covers T1, needs T5 (in search_windows)
+    
+    Expected result:
+    - P2's ring swap commitment is cancelled (direct swap takes precedence)
+    - Simple direct swap: P3 covers T1, P1 covers T5
+    - Notification should show P3 as the participant
+    """
+    directory = InMemoryParticipantDirectory()
+    repository = InMemoryOfferRepository()
+    slack = DummySlack()
+    override_port = FakeOverridePort()
+
+    p1 = directory.upsert(Participant(email="p1@example.com"))
+    p2 = directory.upsert(Participant(email="p2@example.com"))
+    p3 = directory.upsert(Participant(email="p3@example.com"))
+
+    let_window = make_window(0)  # T1
+    search_window = make_window(4)  # T5
+    ring_need_window = make_window(9)  # T10 (outside search_windows)
+
+    schedule_port = FakeSchedulePort(assignments=[])
+
+    service = SwapNegotiationService(
+        repository=repository,
+        directory=directory,
+        schedule_port=schedule_port,
+        override_port=override_port,
+        slack_notifications=slack,
+        slack_prompts=slack,
+    )
+
+    # P1 creates offer
+    offer = service.create_offer(
+        CreateOfferCommand(
+            requester_email=p1.email,
+            schedule_id="primary",
+            let_window=let_window,
+            search_windows=[search_window],
+        )
+    )
+
+    # P2 creates ring swap: covers T1, needs T10
+    service.accept_cover(
+        AcceptCoverCommand(
+            offer_id=offer.id,
+            participant_email=p2.email,
+            covers_window=let_window,
+            needs_windows=[ring_need_window],
+        )
+    )
+
+    # Verify ring swap was created
+    offer = service.get_offer(offer.id)
+    assert len(offer.partial_commitments) == 1
+    assert offer.partial_commitments[0].from_participant.email == p2.email
+    # Compare dates since let_window is a DTO
+    commitment_window = offer.partial_commitments[0].window
+    assert commitment_window.start.date() == dto_to_window(let_window).start.date()
+    assert commitment_window.end.date() == dto_to_window(let_window).end.date()
+    assert len(offer.outstanding_needs) == 1
+    assert offer.outstanding_needs[0].owner.email == p2.email
+    assert offer.outstanding_needs[0].window.start.date() == dto_to_window(ring_need_window).start.date()
+    assert offer.outstanding_needs[0].window.end.date() == dto_to_window(ring_need_window).end.date()
+
+    # P3 makes direct swap: covers T1, needs T5
+    direct_result = service.accept_cover(
+        AcceptCoverCommand(
+            offer_id=offer.id,
+            participant_email=p3.email,
+            covers_window=let_window,
+            needs_windows=[search_window],
+        )
+    )
+
+    # Verify offer is fulfilled
+    offer = service.get_offer(offer.id)
+    assert offer.status.value == "fulfilled"
+    assert len(offer.outstanding_needs) == 0
+    assert len(offer.partial_commitments) == 0  # P2's commitment should be cancelled
+
+    # Verify overrides were applied correctly - should be simple 2-way swap
+    assert len(override_port.applied) == 2
+    
+    # Find assignments
+    p3_assignment = next(a for a in override_port.applied if a.participant.email == p3.email)
+    p1_assignment = next(a for a in override_port.applied if a.participant.email == p1.email)
+
+    # P3 should cover let_window (T1)
+    assert p3_assignment.window.start.date() == dto_to_window(let_window).start.date()
+    assert p3_assignment.window.end.date() == dto_to_window(let_window).end.date()
+    
+    # P1 should cover what P3 needs (T5)
+    assert p1_assignment.window.start.date() == dto_to_window(search_window).start.date()
+    assert p1_assignment.window.end.date() == dto_to_window(search_window).end.date()
+
+    # Verify notification shows P3 as the participant
+    assert len(slack.direct_swaps) == 1
+    notified_participant, notified_window = slack.direct_swaps[0]
+    assert notified_participant.email == p3.email
+    assert notified_window.start.date() == dto_to_window(search_window).start.date()
+    assert notified_window.end.date() == dto_to_window(search_window).end.date()
+
+    # Verify no assignments were passed (simple direct swap, not ring closure)
+    assert len(slack.last_direct_swap_assignments) == 0
 
 def test_create_offer_rejects_past_let_window():
     directory = InMemoryParticipantDirectory()

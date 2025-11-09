@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 from uuid import UUID
 
 from oncall_swap.application.commands import AcceptCoverCommand, CreateOfferCommand, TimeWindowDTO
 from oncall_swap.domain.models import (
+    OfferStatus,
     Participant,
     RingSwap,
     RingSwapCommitment,
@@ -45,6 +47,7 @@ class SwapNegotiationService:
         self.override_port = override_port
         self.slack_notifications = slack_notifications
         self.slack_prompts = slack_prompts
+        self.logger = logging.getLogger(__name__)
 
     def create_offer(self, command: CreateOfferCommand) -> SwapOffer:
         requester = self._ensure_participant(command.requester_email)
@@ -59,9 +62,8 @@ class SwapNegotiationService:
         )
         self.repository.add(offer)
 
-        notifications, prompts = self._require_slack_ports()
+        notifications, _ = self._require_slack_ports()
         notifications.announce_offer(offer)
-        self._prompt_initial_participants(offer)
         return offer
 
     def accept_cover(self, command: AcceptCoverCommand):
@@ -71,94 +73,262 @@ class SwapNegotiationService:
 
         participant = self._ensure_participant(command.participant_email)
         covers_window = self._to_window(command.covers_window)
-        needs_windows = [self._to_window(w) for w in command.needs_windows]
+        needs_window = self._to_window(command.needs_windows[0]) if command.needs_windows else None
 
-        # Direct swap detection
-        if self._is_direct_swap(offer, covers_window, needs_windows):
-            swap = offer.record_direct_swap(participant=participant, swap_window=needs_windows[0])
+        if not needs_window:
+            raise ValueError("Must specify a window to receive in return")
+
+        # Check if this is a direct swap (needs_window is in search_windows)
+        # Any direct swap closes the negotiation
+        search_window_dates = {w.start.date() for w in offer.search_windows}
+        is_direct = needs_window.start.date() in search_window_dates
+
+        if is_direct:
+            # Direct swap: close immediately and apply overrides
+            # Check if this covers the original let_window (by date overlap)
+            let_window_start_date = offer.let_window.start.date()
+            let_window_end_date = offer.let_window.end.date()
+            covers_window_start_date = covers_window.start.date()
+            covers_window_end_date = covers_window.end.date()
+            
+            covers_let_window = (
+                covers_window_start_date <= let_window_end_date
+                and let_window_start_date <= covers_window_end_date
+            )
+            
+            if covers_let_window:
+                # Direct swap covering the original let_window
+                # If someone already committed via ring swap, we should cancel that commitment
+                # and create a simple direct swap instead, since a direct swap takes precedence
+                # Check for any commitment covering let_window (could be from this participant or another)
+                # Use date overlap to find commitments
+                let_commitment = next(
+                    (c for c in offer.partial_commitments 
+                     if (c.window.start.date() <= let_window_end_date
+                         and let_window_start_date <= c.window.end.date())),
+                    None,
+                )
+                
+                if let_commitment:
+                    # Cancel the ring swap commitment - direct swap takes precedence
+                    # This could be the current participant's own commitment or someone else's
+                    commitment_participant = let_commitment.from_participant
+                    
+                    # Trace the entire ring swap chain and remove all related needs and commitments
+                    # Start with the commitment participant
+                    participants_to_clean = {commitment_participant.id}
+                    commitments_to_check = [let_commitment]
+                    checked_commitments = set()
+                    
+                    # Recursively find all participants in the chain by following commitments
+                    while commitments_to_check:
+                        current_commit = commitments_to_check.pop(0)
+                        if id(current_commit) in checked_commitments:
+                            continue
+                        checked_commitments.add(id(current_commit))
+                        
+                        # Find what the commitment participant needs
+                        for need in offer.outstanding_needs:
+                            if (need.owner.id == current_commit.from_participant.id 
+                                and not need.created_by_offer):
+                                # Find who committed to cover this need
+                                for commit in offer.partial_commitments:
+                                    if (commit.window.start.date() <= need.window.end.date()
+                                        and need.window.start.date() <= commit.window.end.date()):
+                                        # This commitment covers the need
+                                        if commit.from_participant.id not in participants_to_clean:
+                                            participants_to_clean.add(commit.from_participant.id)
+                                            commitments_to_check.append(commit)
+                    
+                    # Remove all needs from the chain
+                    offer.outstanding_needs = [
+                        n for n in offer.outstanding_needs 
+                        if not (n.owner.id in participants_to_clean and not n.created_by_offer)
+                    ]
+                    
+                    # Remove all commitments from the chain (including the let_window commitment)
+                    offer.partial_commitments = [
+                        c for c in offer.partial_commitments
+                        if c.from_participant.id not in participants_to_clean
+                    ]
+                
+                # Create simple direct swap: participant covers let_window, requester covers needs_window
+                # Note: record_direct_swap doesn't require the need to exist, it just records the swap
+                swap = offer.record_direct_swap(participant=participant, swap_window=needs_window)
+                self.repository.update(offer)
+                self._apply_direct_override(offer, swap.participant, swap.in_exchange_for)
+                notifications, _ = self._require_slack_ports()
+                notifications.notify_direct_swap(offer, swap.participant, swap.in_exchange_for)
+                return swap
+            
+            # Direct swap covering a ring need (not let_window)
+            need = offer.find_need(covers_window)
+            if not need:
+                # Check if this might be covering let_window with different times/dates
+                # (e.g., let_window is Nov 9, covers_window is Nov 9-10)
+                if (covers_window_start_date <= let_window_end_date
+                    and let_window_start_date <= covers_window_end_date):
+                    # This overlaps with let_window, check if there's a commitment
+                    let_commitment = next(
+                        (c for c in offer.partial_commitments 
+                         if c.window.start.date() == let_window_start_date),
+                        None,
+                    )
+                    if let_commitment:
+                        # Cancel commitment and create direct swap
+                        offer.partial_commitments = [
+                            c for c in offer.partial_commitments 
+                            if not (c.window.start.date() == let_window_start_date)
+                        ]
+                        offer.outstanding_needs = [
+                            n for n in offer.outstanding_needs 
+                            if not (n.owner.id == let_commitment.from_participant.id and not n.created_by_offer)
+                        ]
+                        swap = offer.record_direct_swap(participant=participant, swap_window=needs_window)
+                        self.repository.update(offer)
+                        self._apply_direct_override(offer, swap.participant, swap.in_exchange_for)
+                        notifications, _ = self._require_slack_ports()
+                        notifications.notify_direct_swap(offer, swap.participant, swap.in_exchange_for)
+                        return swap
+                
+                # Debug: log what needs exist
+                self.logger.debug(
+                    "No need found for window %s. Outstanding needs: %s",
+                    covers_window,
+                    [(n.window.start, n.window.end) for n in offer.outstanding_needs],
+                )
+                raise ValueError(f"No outstanding need matches window {covers_window}")
+
+            # Ring swap closure - build full chain of assignments
+            # Start with: participant covers covers_window
+            assignments = [
+                OnCallAssignment(participant=participant, window=covers_window),
+            ]
+            
+            # Track participants already in the chain to avoid duplicates
+            participants_in_chain = {participant.id}
+            
+            # Find who covers the let_window (the original need)
+            # If there are multiple commitments, pick one that doesn't create a cycle
+            let_commitment = None
+            for commit in offer.partial_commitments:
+                if (commit.window.start.date() <= offer.let_window.end.date()
+                    and offer.let_window.start.date() <= commit.window.end.date()):
+                    # Prefer a commitment from someone not already in the chain
+                    if commit.from_participant.id not in participants_in_chain:
+                        let_commitment = commit
+                        break
+            # If all commitments are from people already in chain, use the first one
+            if not let_commitment:
+                let_commitment = next(
+                    (c for c in offer.partial_commitments
+                     if (c.window.start.date() <= offer.let_window.end.date()
+                         and offer.let_window.start.date() <= c.window.end.date())),
+                    None,
+                )
+            
+            if let_commitment and let_commitment.from_participant.id not in participants_in_chain:
+                # Add the commitment: let_commitment.from_participant covers let_window
+                assignments.append(
+                    OnCallAssignment(participant=let_commitment.from_participant, window=offer.let_window)
+                )
+                participants_in_chain.add(let_commitment.from_participant.id)
+                
+                # Find what let_commitment.from_participant needs
+                let_participant_need = next(
+                    (n for n in offer.outstanding_needs if n.owner.id == let_commitment.from_participant.id),
+                    None,
+                )
+                if let_participant_need and let_participant_need.window.to_tuple() == covers_window.to_tuple():
+                    # This need is being covered by the current participant
+                    # The requester will cover needs_window
+                    if offer.requester.id not in participants_in_chain:
+                        assignments.append(
+                            OnCallAssignment(participant=offer.requester, window=needs_window)
+                        )
+                else:
+                    # The requester covers needs_window
+                    if offer.requester.id not in participants_in_chain:
+                        assignments.append(
+                            OnCallAssignment(participant=offer.requester, window=needs_window)
+                        )
+            else:
+                # No valid commitment for let_window (or would create duplicate), requester covers needs_window
+                if offer.requester.id not in participants_in_chain:
+                    assignments.append(
+                        OnCallAssignment(participant=offer.requester, window=needs_window)
+                    )
+
+            # Apply overrides for ring swap closure
+            self.override_port.apply_overrides(offer.schedule_id, assignments)
+            offer.status = OfferStatus.FULFILLED
+            offer.outstanding_needs = []
             self.repository.update(offer)
-            self._apply_direct_override(offer, swap.participant, swap.in_exchange_for)
             notifications, _ = self._require_slack_ports()
-            notifications.notify_direct_swap(offer, swap.participant, swap.in_exchange_for)
-            return swap
+            notifications.notify_direct_swap(offer, participant, needs_window, all_assignments=assignments)
+            return None
 
-        need = offer.resolve_need(covers_window)
+        # Ring swap: needs_window is not in search_windows
+        need = offer.find_need(covers_window)
+        
+        # Special case: if covers_window matches let_window and there's already a commitment,
+        # allow creating another commitment (multiple people can commit to cover let_window)
         if not need:
+            # Check if this is covering let_window
+            if (covers_window.start.date() <= offer.let_window.end.date()
+                and offer.let_window.start.date() <= covers_window.end.date()):
+                # Check if there's already a commitment for let_window
+                existing_commitment = next(
+                    (c for c in offer.partial_commitments
+                     if (c.window.start.date() <= offer.let_window.end.date()
+                         and offer.let_window.start.date() <= c.window.end.date())),
+                    None,
+                )
+                if existing_commitment:
+                    # Multiple people can commit to cover let_window
+                    # Create a need for let_window if it doesn't exist (it was resolved by first commitment)
+                    # But we'll use the original let_window need concept
+                    # Actually, we should create a commitment without resolving a need
+                    # Since the need was already resolved, we'll create a new need entry for tracking
+                    need = WindowNeed(owner=offer.requester, window=offer.let_window, created_by_offer=True)
+                    # Don't add it to outstanding_needs since it's already been committed to
+                    # Just create the commitment
+                    offer.add_commitment(participant, need)
+                    # Add new need for what the participant wants
+                    if needs_window.start.date() not in {n.window.start.date() for n in offer.outstanding_needs}:
+                        offer.outstanding_needs.append(
+                            WindowNeed(owner=participant, window=needs_window, created_by_offer=False)
+                        )
+                    self.repository.update(offer)
+                    notifications, _ = self._require_slack_ports()
+                    notifications.notify_ring_update(offer)
+                    return None
+        
+        if not need:
+            # Debug: log what needs exist
+            self.logger.debug(
+                "No need found for window %s. Outstanding needs: %s",
+                covers_window,
+                [(n.window.start, n.window.end) for n in offer.outstanding_needs],
+            )
             raise ValueError(f"No outstanding need matches window {covers_window}")
 
+        # Add commitment and create new need
         offer.add_commitment(participant, need)
+        offer.resolve_need(covers_window)  # Remove the covered need
 
-        if covers_window.to_tuple() == offer.let_window.to_tuple():
-            offer.record_ring_candidate(participant, needs_windows)
-            notifications, _ = self._require_slack_ports()
-            notifications.notify_ring_candidate(offer, participant)
-            self._prompt_for_new_needs(offer, needs_windows, participant)
-        else:
-            offer.add_available_windows(needs_windows)
-            offer.outstanding_needs.extend(
-                WindowNeed(owner=participant, window=window, created_by_offer=False) for window in needs_windows
+        # Add new need for what the participant wants
+        if needs_window.start.date() not in {n.window.start.date() for n in offer.outstanding_needs}:
+            offer.outstanding_needs.append(
+                WindowNeed(owner=participant, window=needs_window, created_by_offer=False)
             )
-            self._prompt_for_new_needs(offer, needs_windows, participant)
 
         self.repository.update(offer)
-        ring = self._try_complete_ring(offer)
-
-        if ring:
-            assignments = [
-                OnCallAssignment(participant=commitment.from_participant, window=commitment.window)
-                for commitment in ring.commitments
-            ]
-            self.override_port.apply_overrides(offer.schedule_id, assignments)
-            notifications, _ = self._require_slack_ports()
-            notifications.notify_ring_completion(offer)
-            self.repository.update(offer)
-            return ring
-
         notifications, _ = self._require_slack_ports()
         notifications.notify_ring_update(offer)
-        self.repository.update(offer)
         return None
 
     # Helpers -----------------------------------------------------------------
-
-    def _prompt_initial_participants(self, offer: SwapOffer) -> None:
-        assignments = self._list_oncall_assignments(offer)
-
-        search_participants: List[Participant] = []
-        ring_participants: List[Participant] = []
-        seen_search = set()
-        seen_ring = set()
-        search_windows = {w.to_tuple() for w in offer.search_windows}
-
-        for assignment in assignments:
-            if assignment.participant.id == offer.requester.id:
-                continue
-            if assignment.window.to_tuple() in search_windows:
-                if assignment.participant.id not in seen_search:
-                    search_participants.append(assignment.participant)
-                    seen_search.add(assignment.participant.id)
-            else:
-                if assignment.participant.id not in seen_ring:
-                    ring_participants.append(assignment.participant)
-                    seen_ring.add(assignment.participant.id)
-
-        _, prompts = self._require_slack_ports()
-        if search_participants:
-            prompts.prompt_cover_request(
-                offer.id,
-                search_participants,
-                offer.let_window,
-                offer.search_windows,
-                offer.requester,
-            )
-        if ring_participants:
-            prompts.prompt_cover_request(
-                offer.id,
-                ring_participants,
-                offer.let_window,
-                offer.available_windows,
-                offer.requester,
-            )
 
     def _apply_direct_override(self, offer: SwapOffer, participant: Participant, swap_window: TimeWindow) -> None:
         assignments = [
@@ -167,48 +337,6 @@ class SwapNegotiationService:
         ]
         self.override_port.apply_overrides(offer.schedule_id, assignments)
 
-    def _try_complete_ring(self, offer: SwapOffer) -> Optional[RingSwap]:
-        if not offer.partial_commitments:
-            return None
-
-        if not offer.outstanding_needs:
-            # Edge case: someone covered without requiring anything.
-            return self._finalize_ring(offer, [])
-
-        closable_needs = [
-            need for need in offer.outstanding_needs if need.window.to_tuple() in {w.to_tuple() for w in offer.search_windows}
-        ]
-        if not closable_needs:
-            return None
-        if len(closable_needs) != len(offer.outstanding_needs):
-            # Some needs still require third-party coverage.
-            return None
-
-        final_commitments = [
-            RingSwapCommitment(
-                from_participant=offer.requester,
-                to_participant=need.owner,
-                window=need.window,
-            )
-            for need in closable_needs
-        ]
-        return self._finalize_ring(offer, final_commitments)
-
-    def _finalize_ring(self, offer: SwapOffer, final_commitments: List[RingSwapCommitment]) -> Optional[RingSwap]:
-        commitments = offer.partial_commitments + final_commitments
-        unique_participants = {c.from_participant.id for c in commitments}
-        if len(commitments) < 3 or len(unique_participants) < 3:
-            return None
-        ring = RingSwap(commitments=commitments)
-        offer.record_ring_swap(ring)
-        return ring
-
-    def _is_direct_swap(self, offer: SwapOffer, covers_window: TimeWindow, needs_windows: List[TimeWindow]) -> bool:
-        if covers_window.to_tuple() != offer.let_window.to_tuple():
-            return False
-        if len(needs_windows) != 1:
-            return False
-        return needs_windows[0].to_tuple() in {w.to_tuple() for w in offer.search_windows}
 
     def _get_offer(self, offer_id: UUID) -> SwapOffer:
         offer = self.repository.get(offer_id)
@@ -250,55 +378,9 @@ class SwapNegotiationService:
     def _to_window(dto: TimeWindowDTO) -> TimeWindow:
         return TimeWindow(start=dto.start, end=dto.end)
 
-    def _require_slack_ports(self) -> tuple[SlackNotificationPort, SlackPromptPort]:
-        if self.slack_notifications is None or self.slack_prompts is None:
-            raise RuntimeError("Slack ports are not configured for SwapNegotiationService.")
+    def _require_slack_ports(self) -> tuple[SlackNotificationPort, Optional[SlackPromptPort]]:
+        if self.slack_notifications is None:
+            raise RuntimeError("Slack notifications port is not configured for SwapNegotiationService.")
         return self.slack_notifications, self.slack_prompts
 
-    def _list_oncall_assignments(self, offer: SwapOffer) -> List[OnCallAssignment]:
-        windows = [offer.let_window] + list(offer.search_windows)
-        start = min(window.start for window in windows)
-        end = max(window.end for window in windows)
-        return self.schedule_port.list_oncall(
-            schedule_id=offer.schedule_id,
-            start=start,
-            end=end,
-        )
-
-    def _search_participants(self, offer: SwapOffer) -> List[Participant]:
-        assignments = self._list_oncall_assignments(offer)
-        search_windows = {w.to_tuple() for w in offer.search_windows}
-        participants: List[Participant] = []
-        seen = set()
-        for assignment in assignments:
-            if assignment.participant.id == offer.requester.id:
-                continue
-            if assignment.window.to_tuple() in search_windows and assignment.participant.id not in seen:
-                participants.append(assignment.participant)
-                seen.add(assignment.participant.id)
-        return participants
-
-    def _prompt_for_new_needs(
-        self,
-        offer: SwapOffer,
-        needs_windows: List[TimeWindow],
-        owner: Participant,
-    ) -> None:
-        _, prompts = self._require_slack_ports()
-        candidates = [p for p in self._search_participants(offer) if p.id != owner.id]
-        if not candidates:
-            return
-        seen = set()
-        for need in needs_windows:
-            key = need.to_tuple()
-            if key in seen:
-                continue
-            seen.add(key)
-            prompts.prompt_cover_request(
-                offer.id,
-                candidates,
-                need,
-                offer.available_windows,
-                owner,
-            )
 
