@@ -8,7 +8,7 @@ from uuid import UUID
 from slack_bolt import App
 from slack_sdk import WebClient
 
-from oncall_swap.application.commands import AcceptCoverCommand, TimeWindowDTO
+from oncall_swap.application.commands import AcceptCoverCommand, CreateOfferCommand, TimeWindowDTO
 from oncall_swap.application.services import SwapNegotiationService
 from oncall_swap.domain.models import Participant, SwapOffer, TimeWindow
 from oncall_swap.ports.slack import SlackNotificationPort, SlackPromptPort
