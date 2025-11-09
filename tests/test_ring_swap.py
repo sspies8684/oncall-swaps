@@ -202,6 +202,71 @@ def test_ring_and_direct_swap_resolution():
 
     assert ring_result is not None
     assert slack.ring_completions == 1
+
+
+def test_ring_candidate_then_direct_swap_closes_offer():
+    directory = InMemoryParticipantDirectory()
+    repository = InMemoryOfferRepository()
+    slack = DummySlack()
+    override_port = FakeOverridePort()
+
+    requester = directory.upsert(Participant(email="p1@example.com"))
+    ring_participant = directory.upsert(Participant(email="p3@example.com"))
+    direct_participant = directory.upsert(Participant(email="p2@example.com"))
+
+    let_window = make_window(0)  # T1
+    search_window = make_window(4)  # T5
+    ring_need_window = make_window(2)  # T3
+
+    schedule_port = FakeSchedulePort(
+        assignments=[
+            OnCallAssignment(participant=direct_participant, window=dto_to_window(search_window)),
+            OnCallAssignment(participant=ring_participant, window=dto_to_window(ring_need_window)),
+        ]
+    )
+
+    service = SwapNegotiationService(
+        repository=repository,
+        directory=directory,
+        schedule_port=schedule_port,
+        override_port=override_port,
+        slack_notifications=slack,
+        slack_prompts=slack,
+    )
+
+    offer = service.create_offer(
+        CreateOfferCommand(
+            requester_email=requester.email,
+            schedule_id="primary",
+            let_window=let_window,
+            search_windows=[search_window],
+        )
+    )
+
+    # Ring participant volunteers first and asks for coverage.
+    service.accept_cover(
+        AcceptCoverCommand(
+            offer_id=offer.id,
+            participant_email=ring_participant.email,
+            covers_window=let_window,
+            needs_windows=[ring_need_window],
+        )
+    )
+
+    # Before the ring need is satisfied, a direct swapper takes the let window.
+    direct_result = service.accept_cover(
+        AcceptCoverCommand(
+            offer_id=offer.id,
+            participant_email=direct_participant.email,
+            covers_window=let_window,
+            needs_windows=[search_window],
+        )
+    )
+
+    assert direct_result is not None
+    assert slack.direct_swaps[-1] == direct_participant.email
+    assert slack.ring_completions == 0
+
 def test_create_offer_rejects_past_let_window():
     directory = InMemoryParticipantDirectory()
     repository = InMemoryOfferRepository()
