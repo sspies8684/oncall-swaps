@@ -32,7 +32,7 @@ class FakeOverridePort(OpsgenieOverridePort):
 class DummySlack(SlackNotificationPort, SlackPromptPort):
     def __init__(self) -> None:
         self.announcements: List[SwapOffer] = []
-        self.prompt_requests: List[tuple[UUID, List[str]]] = []
+        self.prompt_requests: List[tuple[UUID, List[str], str]] = []
         self.direct_swaps: List[str] = []
         self.ring_completions: int = 0
 

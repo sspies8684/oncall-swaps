@@ -243,6 +243,9 @@ class SwapNegotiationService:
             if assignment.participant.email.lower() == target_email
         ]
 
+    def get_offer(self, offer_id: UUID) -> SwapOffer:
+        return self._get_offer(offer_id)
+
     @staticmethod
     def _to_window(dto: TimeWindowDTO) -> TimeWindow:
         return TimeWindow(start=dto.start, end=dto.end)
