@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
-from typing import Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 from uuid import UUID
 
 from slack_bolt import App
@@ -36,6 +36,8 @@ class SlackBotAdapter(SlackNotificationPort, SlackPromptPort):
         self.negotiation_service = negotiation_service
         self.announcement_channel = announcement_channel
         self.schedule_id = schedule_id
+        self._offer_threads: Dict[UUID, Tuple[str, str]] = {}
+        self._window_labels: Dict[UUID, Dict[Tuple[str, str], str]] = {}
         # Ensure the service outputs through this adapter.
         self.negotiation_service.slack_notifications = self
         self.negotiation_service.slack_prompts = self
@@ -44,17 +46,22 @@ class SlackBotAdapter(SlackNotificationPort, SlackPromptPort):
     # SlackNotificationPort ---------------------------------------------------
 
     def announce_offer(self, offer: SwapOffer) -> None:
-        self.app.client.chat_postMessage(
+        response = self.app.client.chat_postMessage(
             channel=self.announcement_channel,
             text=f"🌀 New on-call swap offer from {offer.requester.email}",
-            blocks=_offer_blocks(offer),
+            blocks=_offer_blocks(offer, self._labels_for(offer)),
         )
+        self._offer_threads[offer.id] = (response["channel"], response["ts"])
+        labels = self._window_labels.setdefault(offer.id, {})
+        for window in offer.available_windows:
+            labels[_window_key(window)] = f"Requester availability ({offer.requester.email})"
 
     def notify_direct_swap(self, offer: SwapOffer, participant: Participant, window: TimeWindow) -> None:
-        self.app.client.chat_postMessage(
-            channel=self.announcement_channel,
-            text="✅ On-call swap completed.",
-            blocks=[
+        labels = self._labels_for(offer)
+        self._post_update(
+            offer.id,
+            "✅ On-call swap completed.",
+            [
                 {
                     "type": "section",
                     "text": {
@@ -62,7 +69,8 @@ class SlackBotAdapter(SlackNotificationPort, SlackPromptPort):
                         "text": (
                             f"*Direct swap complete*\n"
                             f"{participant.email} covers `{_window_to_str(offer.let_window)}` "
-                            f"in exchange for `{_window_to_str(window)}`."
+                            f"in exchange for `{_window_to_str(window)}` "
+                            f"({labels.get(_window_key(window), 'trade window')})."
                         ),
                     },
                 }
@@ -70,10 +78,15 @@ class SlackBotAdapter(SlackNotificationPort, SlackPromptPort):
         )
 
     def notify_ring_candidate(self, offer: SwapOffer, candidate: Participant) -> None:
-        self.app.client.chat_postMessage(
-            channel=self.announcement_channel,
-            text="🔄 Ring swap candidate identified.",
-            blocks=[
+        labels = self._window_labels.setdefault(offer.id, {})
+        for window in offer.available_windows:
+            key = _window_key(window)
+            labels.setdefault(key, f"Needs coverage for {candidate.email}")
+
+        self._post_update(
+            offer.id,
+            "🔄 Ring swap candidate identified.",
+            [
                 {
                     "type": "section",
                     "text": {
@@ -84,22 +97,23 @@ class SlackBotAdapter(SlackNotificationPort, SlackPromptPort):
                         ),
                     },
                 },
-                *_availability_blocks(offer),
+                *_availability_blocks(offer, labels),
             ],
         )
 
     def notify_ring_update(self, offer: SwapOffer) -> None:
-        self.app.client.chat_postMessage(
-            channel=self.announcement_channel,
-            text="🔁 On-call ring swap updated.",
-            blocks=_availability_blocks(offer),
+        labels = self._labels_for(offer)
+        self._post_update(
+            offer.id,
+            "🔁 On-call ring swap updated.",
+            _availability_blocks(offer, labels),
         )
 
     def notify_ring_completion(self, offer: SwapOffer) -> None:
-        self.app.client.chat_postMessage(
-            channel=self.announcement_channel,
-            text="🎉 Ring swap completed.",
-            blocks=[
+        self._post_update(
+            offer.id,
+            "🎉 Ring swap completed.",
+            [
                 {
                     "type": "section",
                     "text": {
@@ -109,6 +123,8 @@ class SlackBotAdapter(SlackNotificationPort, SlackPromptPort):
                 }
             ],
         )
+        self._offer_threads.pop(offer.id, None)
+        self._window_labels.pop(offer.id, None)
 
     # SlackPromptPort ---------------------------------------------------------
 
@@ -120,12 +136,13 @@ class SlackBotAdapter(SlackNotificationPort, SlackPromptPort):
         available_alternatives: Iterable[TimeWindow],
     ) -> None:
         client: WebClient = self.app.client
+        labels = self._window_labels.setdefault(offer_id, {})
         alternatives = list(available_alternatives)
         for participant in candidates:
             client.chat_postMessage(
                 channel=participant.slack_user_id or self.announcement_channel,
                 text=f"On-call coverage request for {_window_to_str(window)}.",
-                blocks=_prompt_blocks(offer_id, window, alternatives),
+                blocks=_prompt_blocks(offer_id, window, alternatives, labels),
             )
 
     # Internal ----------------------------------------------------------------
@@ -270,6 +287,31 @@ class SlackBotAdapter(SlackNotificationPort, SlackPromptPort):
                         user=user_id,
                         text=f"Failed to create offer: {exc}",
                     )
+
+    def _post_update(self, offer_id: UUID, text: str, blocks: Optional[List[dict]] = None) -> None:
+        channel_ts = self._offer_threads.get(offer_id)
+        if channel_ts:
+            channel, thread_ts = channel_ts
+            self.app.client.chat_postMessage(
+                channel=channel,
+                text=text,
+                blocks=blocks,
+                thread_ts=thread_ts,
+            )
+        else:
+            response = self.app.client.chat_postMessage(
+                channel=self.announcement_channel,
+                text=text,
+                blocks=blocks,
+            )
+            self._offer_threads[offer_id] = (response["channel"], response["ts"])
+
+    def _labels_for(self, offer: SwapOffer) -> Dict[Tuple[str, str], str]:
+        labels = self._window_labels.setdefault(offer.id, {})
+        for window in offer.available_windows:
+            labels.setdefault(_window_key(window), "Trade window")
+        return labels
+
 def _build_swap_offer_modal(options: List[dict], metadata: str) -> dict:
     return {
         "type": "modal",
@@ -352,24 +394,24 @@ def _combine_date_time(date_str: str | None, time_str: str | None) -> Optional[d
     return combined.astimezone(timezone.utc)
 
 
-def _offer_blocks(offer: SwapOffer) -> List[dict]:
+def _offer_blocks(offer: SwapOffer, labels: Dict[Tuple[str, str], str]) -> List[dict]:
     return [
         {
             "type": "section",
             "text": {
                 "type": "mrkdwn",
-                "text": (
-                    f"*New swap offer*\n"
-                    f"Requester: `{offer.requester.email}`\n"
-                    f"Needs coverage for: `{_window_to_str(offer.let_window)}`\n"
-                    f"Can cover: {', '.join(f'`{_window_to_str(win)}`' for win in offer.available_windows)}"
-                ),
+                "text": _offer_summary_text(offer, labels),
             },
         }
     ]
 
 
-def _prompt_blocks(offer_id: UUID, window: TimeWindow, alternatives: List[TimeWindow]) -> List[dict]:
+def _prompt_blocks(
+    offer_id: UUID,
+    window: TimeWindow,
+    alternatives: List[TimeWindow],
+    labels: Dict[Tuple[str, str], str],
+) -> List[dict]:
     return [
         {
             "type": "section",
@@ -391,7 +433,10 @@ def _prompt_blocks(offer_id: UUID, window: TimeWindow, alternatives: List[TimeWi
                     "action_id": "swap_accept",
                     "options": [
                         {
-                            "text": {"type": "plain_text", "text": _window_to_str(option)},
+                                "text": {
+                                    "type": "plain_text",
+                                    "text": _annotated_window(option, labels),
+                                },
                             "value": json.dumps(
                                 {
                                     "offer_id": str(offer_id),
@@ -408,17 +453,38 @@ def _prompt_blocks(offer_id: UUID, window: TimeWindow, alternatives: List[TimeWi
     ]
 
 
-def _availability_blocks(offer: SwapOffer) -> List[dict]:
+def _availability_blocks(offer: SwapOffer, labels: Dict[Tuple[str, str], str]) -> List[dict]:
     return [
         {
             "type": "section",
             "text": {
                 "type": "mrkdwn",
-                "text": (
-                    "*Updated availability*\n"
-                    f"Coverage sought for: `{_window_to_str(offer.let_window)}`\n"
-                    f"Trade options now include: {', '.join(f'`{_window_to_str(win)}`' for win in offer.available_windows)}"
-                ),
+                "text": _offer_summary_text(offer, labels, header="*Updated availability*"),
             },
         }
     ]
+
+
+def _offer_summary_text(offer: SwapOffer, labels: Dict[Tuple[str, str], str], header: str = "*New swap offer*") -> str:
+    trade_lines = "\n".join(
+        f"• `{_window_to_str(win)}` – {labels.get(_window_key(win), 'trade window')}"
+        for win in offer.available_windows
+    )
+    return (
+        f"{header}\n"
+        f"Needs coverage for: `{_window_to_str(offer.let_window)}`\n"
+        f"Trade options:\n"
+        f"{trade_lines}"
+    )
+
+
+def _annotation(labels: Dict[Tuple[str, str], str], window: TimeWindow) -> str:
+    return labels.get(_window_key(window), "trade window")
+
+
+def _annotated_window(window: TimeWindow, labels: Dict[Tuple[str, str], str]) -> str:
+    return f"{_window_to_str(window)} — {_annotation(labels, window)}"
+
+
+def _window_key(window: TimeWindow) -> Tuple[str, str]:
+    return window.start.isoformat(), window.end.isoformat()
