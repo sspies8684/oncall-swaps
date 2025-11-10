@@ -15,6 +15,7 @@ from oncall_swap.domain.models import (
     TimeWindow,
     WindowNeed,
 )
+from oncall_swap.domain.time import Instant
 from oncall_swap.ports.directory import ParticipantDirectoryPort
 from oncall_swap.ports.opsgenie import OnCallAssignment, OpsgenieOverridePort, OpsgenieSchedulePort
 from oncall_swap.ports.persistence import OfferRepository
@@ -49,7 +50,7 @@ class SwapNegotiationService:
         self.slack_prompts = slack_prompts
         self.logger = logging.getLogger(__name__)
 
-    def create_offer(self, command: CreateOfferCommand) -> SwapOffer:
+    def create_offer(self, command: CreateOfferCommand, now: Optional[Instant] = None) -> SwapOffer:
         requester = self._ensure_participant(command.requester_email)
         let_window = self._to_window(command.let_window)
         search_windows = [self._to_window(w) for w in command.search_windows]
@@ -59,6 +60,7 @@ class SwapNegotiationService:
             schedule_id=command.schedule_id,
             let_window=let_window,
             search_windows=search_windows,
+            now=now,
         )
         self.repository.add(offer)
 

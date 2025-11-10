@@ -7,10 +7,14 @@ import pytest
 from oncall_swap.application.commands import AcceptCoverCommand, CreateOfferCommand, TimeWindowDTO
 from oncall_swap.application.services import SwapNegotiationService
 from oncall_swap.domain.models import Participant, SwapOffer, TimeWindow
+from oncall_swap.domain.time import Instant
 from oncall_swap.infrastructure.directory.in_memory import InMemoryParticipantDirectory
 from oncall_swap.infrastructure.persistence.in_memory import InMemoryOfferRepository
 from oncall_swap.ports.opsgenie import OnCallAssignment, OpsgenieOverridePort, OpsgenieSchedulePort
 from oncall_swap.ports.slack import SlackNotificationPort, SlackPromptPort
+
+# Fixed test instant: Nov 10, 2025 at 8:00 AM UTC
+TEST_NOW = Instant(at=datetime(2025, 11, 10, 8, 0, 0, tzinfo=timezone.utc))
 
 
 class FakeSchedulePort(OpsgenieSchedulePort):
@@ -72,11 +76,9 @@ class DummySlack(SlackNotificationPort, SlackPromptPort):
 
 
 def make_window(day_offset: int) -> TimeWindowDTO:
-    now = datetime.now(timezone.utc)
-    # Start at midnight UTC tomorrow (day_offset=0 means tomorrow), then add day_offset and set to 9:00 AM
-    # This ensures windows are always in the future
-    base = datetime(now.year, now.month, now.day, 9, 0, tzinfo=timezone.utc)
-    start = base + timedelta(days=1 + day_offset)  # +1 to ensure it's always tomorrow or later
+    # Use fixed base date: Nov 10, 2025 at 9:00 AM UTC
+    base = datetime(2025, 11, 10, 9, 0, 0, tzinfo=timezone.utc)
+    start = base + timedelta(days=day_offset)
     end = start + timedelta(hours=12)
     return TimeWindowDTO(start=start, end=end)
 
@@ -123,7 +125,7 @@ def test_ring_swap_resolution():
         search_windows=[search_window],
     )
 
-    offer = service.create_offer(command)
+    offer = service.create_offer(command, now=TEST_NOW)
 
     # P3 covers let window, needs T14.
     service.accept_cover(
@@ -191,7 +193,7 @@ def test_ring_and_direct_swap_resolution():
         search_windows=[direct_trade],
     )
 
-    offer = service.create_offer(command)
+    offer = service.create_offer(command, now=TEST_NOW)
 
     # Ring participant covers let window, needs T3.
     service.accept_cover(
@@ -254,7 +256,8 @@ def test_ring_candidate_then_direct_swap_closes_offer():
             schedule_id="primary",
             let_window=let_window,
             search_windows=[search_window],
-        )
+        ),
+        now=TEST_NOW,
     )
 
     # Ring participant volunteers first and asks for coverage.
@@ -326,7 +329,8 @@ def test_ring_swap_then_direct_swap_to_let_window():
             schedule_id="primary",
             let_window=let_window,
             search_windows=[search_window],
-        )
+        ),
+        now=TEST_NOW,
     )
 
     # P2 creates ring swap: covers T1, needs T10
@@ -409,7 +413,8 @@ def test_create_offer_rejects_past_let_window():
         slack_prompts=slack,
     )
 
-    past_start = datetime.now(timezone.utc) - timedelta(days=1)
+    # Create a window that's in the past relative to TEST_NOW
+    past_start = TEST_NOW.to_datetime() - timedelta(days=1)
     past_window = TimeWindowDTO(start=past_start, end=past_start + timedelta(hours=12))
 
     command = CreateOfferCommand(
@@ -420,7 +425,7 @@ def test_create_offer_rejects_past_let_window():
     )
 
     with pytest.raises(SwapOffer.TimeWindowInPastError):
-        service.create_offer(command)
+        service.create_offer(command, now=TEST_NOW)
 
 
 def test_create_offer_rejects_past_search_window():
@@ -440,7 +445,8 @@ def test_create_offer_rejects_past_search_window():
     )
 
     future_let = make_window(1)
-    past_start = datetime.now(timezone.utc) - timedelta(days=1)
+    # Create a window that's in the past relative to TEST_NOW
+    past_start = TEST_NOW.to_datetime() - timedelta(days=1)
     past_search = TimeWindowDTO(start=past_start, end=past_start + timedelta(hours=12))
 
     command = CreateOfferCommand(
@@ -451,4 +457,4 @@ def test_create_offer_rejects_past_search_window():
     )
 
     with pytest.raises(SwapOffer.TimeWindowInPastError):
-        service.create_offer(command)
+        service.create_offer(command, now=TEST_NOW)
