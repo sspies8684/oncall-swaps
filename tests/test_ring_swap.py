@@ -72,7 +72,11 @@ class DummySlack(SlackNotificationPort, SlackPromptPort):
 
 
 def make_window(day_offset: int) -> TimeWindowDTO:
-    start = datetime(2025, 11, 10, 9, 0) + timedelta(days=day_offset)
+    now = datetime.now(timezone.utc)
+    # Start at midnight UTC tomorrow (day_offset=0 means tomorrow), then add day_offset and set to 9:00 AM
+    # This ensures windows are always in the future
+    base = datetime(now.year, now.month, now.day, 9, 0, tzinfo=timezone.utc)
+    start = base + timedelta(days=1 + day_offset)  # +1 to ensure it's always tomorrow or later
     end = start + timedelta(hours=12)
     return TimeWindowDTO(start=start, end=end)
 
